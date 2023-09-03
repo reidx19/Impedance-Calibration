@@ -174,7 +174,7 @@ def objective_function(betas,links,sources,G):
     
     #do shortest path routing
     shortest_paths = {}
-    print('Shortest path routing')
+    print(f'Shortest path routing with coefficients: {betas}')
     for source in tqdm(sources):
         #perform shortest path routing (from one to all)
         length, paths = nx.single_source_dijkstra(G,source,weight='weight')
