@@ -150,6 +150,10 @@ Overlap does not currently count looping back on the same link unless it is in t
 
 '''
 
+with (fp/'shortest_paths.pkl').open('rb') as fh:
+     shortest_paths = pickle.load(fh)
+
+
 #create dict of link lengths for lookup
 link_lengths = dict(zip(links['tup'],links['length_ft']))
 
@@ -165,12 +169,14 @@ for key, item in tqdm(shortest_paths.items()):
     for tripid in tripids:
         chosen_edges = matched_traces[tripid]['edges']
         chosen_edges = [(int(link1),int(link2)) for link1,link2 in chosen_edges]
-        chosen_length = np.sum([link_lengths.get(link_tup,'error') for link_tup in chosen_edges])
+        chosen_length = np.array([link_lengths.get(link_tup,0) for link_tup in chosen_edges]).sum()
         trips_df.loc[trips_df['tripid']==tripid,'chosen_length'] = chosen_length
         
         chosen_and_shortest = set(chosen_edges) & set(item['edge_list'])
-        overlap_length = np.sum([link_lengths.get(link_tup,'error') for link_tup in chosen_and_shortest])
+        overlap_length = np.array([link_lengths.get(link_tup,0) for link_tup in chosen_and_shortest]).sum()
         trips_df.loc[trips_df['tripid']==tripid,'overlap_length'] = overlap_length
+
+overlap_prop = trips_df['overlap_length'].sum() / trips_df['chosen_length'].sum()
 
 # calculate detour percent (if negative something then wrong way travel was involved)
 trips_df['detour_rate'] = ((trips_df['chosen_length'] - trips_df['shortest_length']) / trips_df['shortest_length'] * 100).round(0)
