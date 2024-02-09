@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from stochopy.optimize import minimize
+from shapely.ops import nearest_points, Point, MultiLineString
 import pickle
 import numpy as np
 import pandas as pd
@@ -11,6 +12,10 @@ from tqdm import tqdm
 import time
 from datetime import timedelta
 import ast
+import shapely
+
+import modeling_turns
+import stochastic_optimization
 
 '''
 This module is for deriving link costs from matched GPS traces
@@ -28,291 +33,419 @@ Pre-Algo:
 Algo Steps:
 
 Todo:
-Using initial betas to see how well they recreate routes
+- Change the beta array structure to allow for flexible impedance functions
+that can be archived after optimization (not sure if this is possible)
+
+- Dict gives the attribute names
 
 
 '''
 
-def create_pseudo_dual_graph(edges):
+#customize this function to change impedance formula
+#TODO streamline process of trying out new impedance functions
+def link_impedance_function(betas,links):
+    #prevent mutating the original links gdf
+    links = links.copy()
     
-    #turn into graph network
-    G = make_graph(edges)
+    attr_multiplier = (betas[0]*~links['bike']) + betas[1]*links['up_grade']
+    links['link_cost'] = links['length_ft'] * attr_multiplier
+    return links
 
-    #use networkx line graph function to create pseudo dual graph
-    G_line = nx.line_graph(G)
-    df_line = nx.to_pandas_edgelist(G_line)
-
-    #get rid of tuples for exporting
-    df_line[['source_A','source_B']] = pd.DataFrame(df_line['source'].tolist(), index=df_line.index)
-    df_line[['target_A','target_B']] = pd.DataFrame(df_line['target'].tolist(), index=df_line.index)
-
-    #merge attributes from df
-    join = edges.copy()
-    join.columns = join.columns + '_x'
-    df_line = df_line.merge(join,left_on=['source_A','source_B'],right_on=['source_x','target_x'])
-    df_line.drop(columns=['source_x','target_x'],inplace=True)
-    
-    join = edges.copy()
-    join.columns = join.columns + '_y'
-    df_line = df_line.merge(join,left_on=['target_A','target_B'],right_on=['source_y','target_y'])
-    df_line.drop(columns=['source_y','target_y'],inplace=True)
-    
-    #remove u-turns
-    u_turn = (df_line['source_A'] == df_line['target_B']) & (df_line['source_B'] == df_line['target_A'])
-    df_line = df_line[-u_turn]
-    
-    #change in bearing
-    df_line['bearing_change'] = df_line['bearing_y'] - df_line['bearing_x']
-    
-    #connect lines
-    df_line['geometry'] = df_line.apply(lambda row: LineString([row['geometry_x'],row['geometry_y']]),axis=1)
-    df_line.drop(columns=['geometry_x','geometry_y'],inplace=True)
-    
-    #make all values positive
-    df_line.loc[df_line['bearing_change'] < 0, 'bearing_change'] = df_line['bearing_change'] + 360 
-    
-    #angle here
-    '''
-    straight < 30 or > 330
-    right >= 30 and <= 150
-    backwards > 150 and less than 210
-    left >= 210 and <= 270 
-    
-    '''
-    straight = (df_line['bearing_change'] > 330) | (df_line['bearing_change'] < 30) 
-    right = (df_line['bearing_change'] >= 30) & (df_line['bearing_change'] <= 150)
-    backwards = (df_line['bearing_change'] > 150) & (df_line['bearing_change'] < 210)
-    left = (df_line['bearing_change'] >= 210) & (df_line['bearing_change'] <= 330)
-    
-    df_line.loc[straight,'turn_type'] = 'straight'
-    df_line.loc[right,'turn_type'] = 'right'
-    df_line.loc[backwards,'turn_type'] = 'backwards'
-    df_line.loc[left,'turn_type'] = 'left'
-    
-    #throw out backwards for now
-    df_line = df_line[df_line['turn_type']!='backwards']
-    
-    #turn to gdf
-    df_line = gpd.GeoDataFrame(df_line,crs=edges.crs,geometry='geometry')
-
-    #psuedo graph too
-    for row in df_line[['source','target']].itertuples(index=False):
-        pseudo_G.add_weighted_edges_from([(row[0],row[1],0)],weight='weight') 
-    
-    return df_line, psuedo_G
-
-def add_virtual_links(pseudo_df,pseudo_G,start_node:int,end_nodes:list):
-
-    '''
-    Adds directed virtual links with length 0 needed to perform routing on the pseudo-dual graph network graph.
-    
-    Notes:
-        network_df must have a source and target column with those names
-        psudeo_df must have two columns for each source and target link
-            for the source link: source_A and source_B
-            for the target link: target_A and target_B
-        run remove_virtual links afterwards to remove these virtual links
-    '''    
-
-    #grab all psuedo graph edges that contain the starting node in the SOURCE_A column (going away from starting node)
-    starting_set = pseudo_df.loc[pseudo_df['source_A'] == start_node,['source_A','source']]
-    starting_set.columns = ['source','target']
-
-    #grab all psuedo graph edges that contain the starting node in the TARGET column (going towards the starting node)
-    ending_set = pseudo_df.loc[pseudo_df['target_B'].isin(set(end_nodes)),['target','target_B']]
-    ending_set.columns = ['source','target']
-    
-    virtual_edges = pd.concat([starting_set,ending_set],ignore_index=True)
-    
-    #add virtual edge
-    for row in virtual_edges[['source','target']].itertuples(index=False):
-        pseudo_G.add_weighted_edges_from([(row[0],row[1],0)],weight='weight') 
-
-    return pseudo_G, virtual_edges
-
-def remove_virtual_edges(pseudo_G,virtual_edges):
-    '''
-    Parameters
-    ----------
-    pseudo_G : networkx graph
-        network graph containing the virtual edges
-    virtual_edges : dataframe
-        dataframe containing the virtual edges that need to be removed
-
-    Returns
-    -------
-    pseudo_G : networkx graph
-        network graph without the virtual edges
-
-    '''
-    for row in virtual_edges.itertuples(index=False):
-        pseudo_G.remove_edges_from([(row[0],row[1])])
-        
-    return pseudo_G
-
-
-def objective_function(betas,links,G,ods,trips_df,matched_traces,durations):
-    
-    start_time = time.perf_counter()
-    
-    #beta coefficients
-    betas = np.asarray(betas)
-
-    #use beta coefficients to calculate link costs
-    attribute_cost_x = betas[0]*links['not_infra_x']+betas[1]*links['twolanes_x']+betas[2]*links['here_>30mph_x']
-    attribute_cost_y = betas[0]*links['not_infra_y']+betas[1]*links['twolanes_y']+betas[2]*links['here_>30mph_y']
-    links['cost_x'] = links['length_ft']*(1+attribute_cost_x) + 9000 #large number to keep value positive
-    links['cost_y'] = links['length_ft']*(1+attribute_cost_y) + 9000 #large number to keep value positive
-
+def turn_impedance_function(betas,pseudo_links):
     #use beta coefficient to calculate turn cost
     base_turn_cost = 30 # from Lowry et al 2016 DOI: http://dx.doi.org/10.1016/j.tra.2016.02.003
     turn_costs = {
-        'left': betas[3] * base_turn_cost,
-        'right': betas[4] * base_turn_cost,
-        'straight': betas[5] * base_turn_cost
+        'left': betas[1] * base_turn_cost,
+        'right': betas[1] * base_turn_cost,
+        'straight': betas[1] * base_turn_cost
     }
-    turn_costs = links['turn_type'].map(turn_costs)
+    pseudo_links['turn_cost'] = pseudo_links['turn_type'].map(turn_costs)
+    return pseudo_links
 
-    #add everything together
-    links['total_cost'] = links['cost_x'] + links['cost_y'] + turn_costs
+def objective_function(betas,links,pseudo_links,pseudo_G,matched_traces,exact=False,follow_up=False):
 
-    #turn into dict (test this)
-    costs = dict(zip(list(zip(links['source'],links['target'])),links['total_cost']))
+    #prevent negative link weights
+    if (betas < 0).any():
+        val = 0
+        return val
+
+    #TODO bring most of this out as functions
+    #use initial/updated betas to calculate link costs
+    links = link_impedance_function(betas, links)
+    cost_dict = dict(zip(links['linkid'],links['link_cost']))
+    
+    #TODO is this the best way to accomplish this?
+    #get_geo = links.loc[links.groupby(['source','target'])['link_cost'].idxmin(),['source','target','geometry']]
+
+    #add link costs to pseudo_links
+    pseudo_links['source_link_cost'] = pseudo_links['source_linkid'].map(cost_dict)
+    pseudo_links['target_link_cost'] = pseudo_links['target_linkid'].map(cost_dict)
+
+    #use initial/updated betas to calculate turn costs
+    pseudo_links = turn_impedance_function(betas, pseudo_links)
+
+    #assign na turns a cost of 0
+    pseudo_links.loc[pseudo_links['turn_cost'].isna(),'turn_cost'] = 0
+
+    #add links and multiply by turn cost
+    pseudo_links['total_cost'] = pseudo_links['source_link_cost'] + pseudo_links['target_link_cost'] + pseudo_links['turn_cost']
+
+    #check for negative costs (set them to zero for now?)
+    #pseudo_links.loc[pseudo_links['total_cost'] < 0, 'total_cost'] = 1
+
+    #round values
+    #pseudo_links['total_cost'] = pseudo_links['total_cost'].round(1)
+
+    #only keep link with the lowest cost
+    costs = pseudo_links.groupby(['source','target'])['total_cost'].min()
+
+    #get linkids used
+    source_cols = ['source','source_linkid','source_reverse_link']
+    target_cols = ['target','target_linkid','target_reverse_link']
+    min_links = pseudo_links.loc[pseudo_links.groupby(['source','target'])['total_cost'].idxmin()]
+    source_links = min_links[source_cols]
+    target_links = min_links[target_cols]
+    source_links.columns = ['A_B','linkid','reverse_link']
+    target_links.columns = ['A_B','linkid','reverse_link']
+    linkids = pd.concat([source_links,target_links],ignore_index=True).drop_duplicates().set_index('A_B')
 
     #update edge weights
-    nx.set_edge_attributes(G,values=costs,name='weight')
+    nx.set_edge_attributes(pseudo_G,values=costs,name='weight')
+
+    #update edge ids (what was this for?)
     
     #do shortest path routing
     shortest_paths = {}
-    print(f'Shortest path routing with coefficients: {betas}')
-    sources = list(set([x[0] for x in ods]))
-    for source in sources:
-        targets = list((set([x[1] for x in ods if x[0] == source])))
-        #add virtual links
-        G, virtual_edges = add_virtual_links(links,G,source,targets)
-        #perform shortest path routing for all target nodes from source node (from one to all until target node has been visited)
+    print(f'Shortest path routing with coefficients: {betas}')    
+    for source, targets in matched_traces.groupby('start')['end'].unique().items():
+
+        #add virtual links to pseudo_G
+        pseudo_G, virtual_edges = modeling_turns.add_virtual_links(pseudo_links,pseudo_G,source,targets)
+        
+        #perform shortest path routing for all target nodes from source node
+        #(from one to all until target node has been visited)
         for target in targets:  
+            #cant be numpy int64 or throws an error
+            target = int(target)
+            
+            try:
+                #TODO every result is only a start node, middle node, then end node
+                length, node_list = nx.single_source_dijkstra(pseudo_G,source,target,weight='weight')
+            except:
+                print(source,target)
+                length, node_list = nx.single_source_dijkstra(pseudo_G,source,target,weight='weight')
 
-            length, node_list = nx.single_source_dijkstra(G,source,target,weight='weight')
-            edge_list = [(node_list[i],node_list[i+1]) for i in range(len(node_list)-1)]
-            shortest_paths[(source,target)] = {'edge_list':edge_list,'length':length}
-        
+            #get edge list
+            edge_list = node_list[1:-1]
+
+            #get geometry from edges
+            modeled_edges = links.merge(linkids.loc[edge_list],on=['linkid','reverse_link'],how='inner')
+            modeled_edges = gpd.GeoDataFrame(modeled_edges,geometry='geometry')
+            
+            #
+            shortest_paths[(source,target)] = {
+                'edges': set(modeled_edges['linkid'].tolist()),
+                'geometry':modeled_edges.dissolve()['geometry'].item(),
+                'length':modeled_edges.length.sum()
+                }
+
         #remove virtual links
-        G = remove_virtual_edges(G,virtual_edges)
-
-
-    # #calculate exact overlap
-    # all_overlap = 0
-    # for idx, row in trips_df.iterrows():
-
-    #     try:
-
-    #         modeled_edges = shortest_paths[row['od']]['edge_list']     
+        pseudo_G = modeling_turns.remove_virtual_edges(pseudo_G,virtual_edges)
     
-    #         chosen_edges = matched_traces[row['tripid']]['edges']
-    #         chosen_edges = [(int(link1),int(link2)) for link1,link2 in chosen_edges]
+    #turn shortest paths dict to dataframe
+    shortest_paths = pd.DataFrame.from_dict(shortest_paths,orient='index')
+    shortest_paths.reset_index(inplace=True)
+    shortest_paths.columns = ['start','end','linkids','geometry','length']
+    #shortest_paths[['start','end']] = shortest_paths['index'].apply(lambda x: pd.Series(x))
+    #shortest_paths.drop(columns=['index'],inplace=True)
+
+    #add modeled paths to matched_traces dataframe
+    merged = matched_traces.merge(shortest_paths,on=['start','end'],suffixes=(None,'_modeled'))
+
+    if exact:
+        sum_all = merged['length'].sum() * 5280
+        all_overlap = 0
+
+        for idx, row in merged.iterrows():
+            #find shared edges
+            chosen_and_shortest = row['linkids_modeled'] & row['linkids']
+            #get the lengths of those links
+            overlap_length = links.set_index('linkid').loc[list(chosen_and_shortest)]['length_ft'].sum()
+            #overlap_length = np.sum([link_lengths.get(link_tup,'error') for link_tup in chosen_and_shortest])
+            all_overlap += overlap_length
+
+        #calculate objective function value
+        val = all_overlap / sum_all
+        print('Exact overlap percent is:',np.round(val*100,1),'%')
+    
+    #calculate approximate overlap (new approach)
+    else:
+        #buffer and dissolve generated route and matched route
+        buffer_ft = 500
+
+        merged.set_geometry('geometry',inplace=True)
+        merged['buffered_geometry'] = merged.buffer(buffer_ft)
+        merged.set_geometry('buffered_geometry',inplace=True)
+        merged['area'] = merged.area
+
+        merged.set_geometry('geometry_modeled',inplace=True)
+        merged['buffered_geometry_modeled'] = merged.buffer(buffer_ft)
+        merged.set_geometry('buffered_geometry_modeled',inplace=True)
+        merged['area_modeled'] = merged.area
+
+        #for each row find intersection between buffered features
+        merged['intersection'] = merged.apply(lambda row: row['buffered_geometry'].intersection(row['buffered_geometry_modeled']), axis=1)
+
+        # merged['intersection'] = merged.apply(
+        #     lambda row: shapely.intersection(row['buffered_geometry'],row['buffered_geometry_modeled']))
+        merged.set_geometry('intersection',inplace=True)
+        merged['intersection_area'] = merged.area
+
+        #find the overlap with the total area (not including intersections)
+        #if the modeled/chosen links are different, then overlap decreases
+        #punishes cirquitious modeled routes that utilize every link in the chosen one but include extraneous ones
+        merged['overlap'] = merged['intersection_area'] / (merged['area_modeled'] + merged['area'] - merged['intersection_area'])
+
+        #find average overlap (using median to reduce impact of outliers?)
+        val = merged['overlap'].median()
+        print('Median overlap percent is:',np.round(val*100,1),'%')
+    
+    if follow_up:
+        return merged
+
+    return -val#, merged
+
+def follow_up(betas,links,pseudo_links,pseudo_G,matched_traces,exact=False):
+
+    #
+    modeled_trips = {}
+    
+    #use initial/updated betas to calculate link costs
+    links = link_impedance_function(betas, links)
+    cost_dict = dict(zip(links['linkid'],links['link_cost']))
+    
+    #TODO is this the best way to accomplish this?
+    #get_geo = links.loc[links.groupby(['source','target'])['link_cost'].idxmin(),['source','target','geometry']]
+
+    #add link costs to pseudo_links
+    pseudo_links['source_link_cost'] = pseudo_links['source_linkid'].map(cost_dict)
+    pseudo_links['target_link_cost'] = pseudo_links['target_linkid'].map(cost_dict)
+
+    #use initial/updated betas to calculate turn costs
+    pseudo_links = turn_impedance_function(betas, pseudo_links)
+
+    #assign na turns a cost of 0
+    pseudo_links.loc[pseudo_links['turn_cost'].isna(),'turn_cost'] = 0
+
+    #add links and multiply by turn cost
+    pseudo_links['total_cost'] = pseudo_links['source_link_cost'] + pseudo_links['target_link_cost'] + pseudo_links['turn_cost']
+
+    #only keep link with the lowest cost
+    costs = pseudo_links.groupby(['source','target'])['total_cost'].min()
+
+    #get linkids used
+    source_cols = ['source','source_linkid','source_reverse_link']
+    target_cols = ['target','target_linkid','target_reverse_link']
+    min_links = pseudo_links.loc[pseudo_links.groupby(['source','target'])['total_cost'].idxmin()]
+    source_links = min_links[source_cols]
+    target_links = min_links[target_cols]
+    source_links.columns = ['A_B','linkid','reverse_link']
+    target_links.columns = ['A_B','linkid','reverse_link']
+    linkids = pd.concat([source_links,target_links],ignore_index=True).drop_duplicates().set_index('A_B')
+
+    #update edge weights
+    nx.set_edge_attributes(pseudo_G,values=costs,name='weight')
+    
+    #do shortest path routing
+    shortest_paths = {}
+    print(f'Shortest path routing with coefficients: {betas}')    
+    for source, targets in matched_traces.groupby('start')['end'].unique().items():
+
+        #add virtual links to pseudo_G
+        pseudo_G, virtual_edges = modeling_turns.add_virtual_links(pseudo_links,pseudo_G,source,targets)
+        
+        #perform shortest path routing for all target nodes from source node
+        #(from one to all until target node has been visited)
+        for target in targets:  
+            #cant be numpy int64 or throws an error
+            target = int(target)
             
-    #         chosen_and_shortest = set(chosen_edges) & set(modeled_edges)
+            try:
+                #TODO every result is only a start node, middle node, then end node
+                length, node_list = nx.single_source_dijkstra(pseudo_G,source,target,weight='weight')
+            except:
+                print(source,target)
+                length, node_list = nx.single_source_dijkstra(pseudo_G,source,target,weight='weight')
+
+            #get edge list
+            edge_list = node_list[1:-1]
+
+            #get geometry from edges
+            modeled_edges = links.merge(linkids.loc[edge_list],on=['linkid','reverse_link'],how='inner')
+            modeled_edges = gpd.GeoDataFrame(modeled_edges,geometry='geometry')
             
-    #         overlap_length = np.sum([link_lengths.get(link_tup,'error') for link_tup in chosen_and_shortest])
-    #         all_overlap += overlap_length
-        
-    #     except:
-    #         continue
+            #
+            shortest_paths[(source,target)] = {
+                'edges': set(modeled_edges['linkid'].tolist()),
+                'geometry':MultiLineString(modeled_edges['geometry'].tolist()),
+                'length':modeled_edges.length.sum()
+                }
 
-    #calculate approximate overlap
-    all_overlap = 0
-    for idx, row in trips_df.iterrows():
+        #remove virtual links
+        pseudo_G = modeling_turns.remove_virtual_edges(pseudo_G,virtual_edges)
+    
+    #turn shortest paths dict to dataframe
+    shortest_paths = pd.DataFrame.from_dict(shortest_paths,orient='index')
+    shortest_paths.reset_index(inplace=True)
+    shortest_paths.columns = ['start','end','linkids','geometry','length']
+    #shortest_paths[['start','end']] = shortest_paths['index'].apply(lambda x: pd.Series(x))
+    #shortest_paths.drop(columns=['index'],inplace=True)
 
-        #need these to be gdfs
-        modeled_edges = shortest_paths[row['od']]['edge_list']
-        modeled_edges.geometry = modeled_edges.buffer(buffer_ft)
+    #add modeled paths to matched_traces dataframe
+    merged = matched_traces.merge(shortest_paths,on=['start','end'],suffixes=(None,'_modeled'))
 
-        chosen_edges = matched_traces[row['tripid']]['matched_trip']
-        chosen_edges['original_length'] = chosen_edges.length
-        
-        overlapping = gpd.overlay(chosen_edges)
-        
-        overlap_length = np.sum([link_lengths.get(link_tup,'error') for link_tup in chosen_and_shortest])
-        all_overlap += overlap_length
-        
+    if exact:
+        sum_all = merged['length'].sum() * 5280
+        all_overlap = 0
 
+        for idx, row in merged.iterrows():
+            #find shared edges
+            chosen_and_shortest = row['linkids_modeled'] & row['linkids']
+            #get the lengths of those links
+            overlap_length = links.set_index('linkid').loc[list(chosen_and_shortest)]['length_ft'].sum()
+            #overlap_length = np.sum([link_lengths.get(link_tup,'error') for link_tup in chosen_and_shortest])
+            all_overlap += overlap_length
+
+        #calculate objective function value
+        val = all_overlap / sum_all
+        print('Exact overlap percent is:',np.round(val*100,1),'%')
+    
+    #calculate approximate overlap (new approach)
+    else:
+        #buffer and dissolve generated route and matched route
+        buffer_ft = 500
+
+        merged.set_geometry('geometry',inplace=True)
+        merged['buffered_geometry'] = merged.buffer(buffer_ft)
+        merged.set_geometry('buffered_geometry',inplace=True)
+        merged['area'] = merged.area
+
+        merged.set_geometry('geometry_modeled',inplace=True)
+        merged['buffered_geometry_modeled'] = merged.buffer(buffer_ft)
+        merged.set_geometry('buffered_geometry_modeled',inplace=True)
+        merged['area_modeled'] = merged.area
+
+        #for each row find intersection between buffered features
+        merged['intersection'] = merged.apply(lambda row: row['buffered_geometry'].intersection(row['buffered_geometry_modeled']), axis=1)
+
+        # merged['intersection'] = merged.apply(
+        #     lambda row: shapely.intersection(row['buffered_geometry'],row['buffered_geometry_modeled']))
+        merged.set_geometry('intersection',inplace=True)
+        merged['intersection_area'] = merged.area
+
+        #find the overlap with the total area (not including intersections)
+        #if the modeled/chosen links are different, then overlap decreases
+        #punishes cirquitious modeled routes that utilize every link in the chosen one but include extraneous ones
+        merged['overlap'] = merged['intersection_area'] / (merged['area_modeled'] + merged['area'] - merged['intersection_area'])
+
+        #find average overlap (using median to reduce impact of outliers?)
+        val = merged['overlap'].median()
+        print('Median overlap percent is:',np.round(val*100,1),'%')
+    
+    return -val#, merged         
+
+
+
+        # #calculate approximate overlap
+        # all_overlap = 0
+        # for idx, row in trips_df.iterrows():
+
+        #     #buffer and dissolve generated route and matched route
+        #     modeled_edges = shortest_paths[row['od']]['edge_list']
+        #     chosen_edges = matched_traces[row['tripid']]['matched_trip']
             
+        #     #grab links
+        #     links.index = list(zip(links['A'],links['B']))
+        #     modeled_edges = links.loc[modeled_edges]
 
-    #calculate objective function value
-    val = -1 * all_overlap / sum_all
-    print(val)
+        #     #caluclate absolute difference
+        #     difference_ft = (modeled_edges.length.sum() - chosen_edges.legnth.sum()).abs()
+
+        #     #buffer edges and dissolve
+        #     buffer_ft = 500
+        #     modeled_edges_dissolved = modeled_edges.buffer(buffer_ft).dissolve()
+        #     chosen_edges_dissovled = chosen_edges.buffer(buffer_ft).dissolve()
+
+        #     #intersect
+        #     intersect = gpd.overlay(modeled_edges_dissolved,chosen_edges_dissovled,how='intersection')
+        #     overlap = intersect.area / chosen_edges.area
+            
+        #     #exponent for difference in lengths between generated route and matched route
+        #     #as absolute difference in length increases, overlap gets smaller
+        #     all_overlap += overlap ** difference_ft
+
+        # duration = timedelta(seconds=time.perf_counter()-start_time)
+        # durations.append(duration)
+        # start_time = time.perf_counter()
+
+
+
+    # print('Overlap =', val)
+
+
+
+
+# #import segment to use
+# segment_filepaths = list((fp/'segments').glob('*'))
+# results = {}
+
+# def replace_missing_node(row,trips_df,pseudo_G,nodes):                
+#     source = row['od'][0]
+#     target = row['od'][1]
     
-    duration = timedelta(seconds=time.perf_counter()-start_time)
-    durations.append(duration)
+#     #source column
+#     if ~pseudo_G.has_node(source):
+#         start_coord = row[['start_lat','start_lon']]
+#         start_coord['geometry'] = Point(start_coord.iloc[0,1],start_coord.iloc[0,0])
+#         start_coord = gpd.GeoDataFrame(start_coord,geometry='geometry',crs='epsg:4326')
+#         start_coord.to_crs(nodes.crs)
+#         source = gpd.sjoin_nearest(start_start_coord, nodes)['N'].item()
+        
+#     if ~pseudo_G.has_node(target):
+#         end_coord = trips_df.loc[trips_df['od']==(source,target),['end_lat','end_lon']].iloc[0]
+#         end_coord['geometry'] = Point(end_coord.iloc[0,1],end_coord.iloc[0,0])
+#         end_coord = gpd.GeoDataFrame(end_coord,geometry='geometry',crs='epsg:4326')
+#         end_coord.to_crs(nodes.crs)
+#         target = gpd.sjoin_nearest(end_coord, nodes)['N'].item()
+        
+#     return (source,target)
+
+# for segment_filepath in segment_filepaths:
+#     trips_df = pd.read_csv(segment_filepath)
+#     #turn to tuple
+#     trips_df['od'] = trips_df['od'].apply(lambda row: ast.literal_eval(row))
+#     trips_df['od'] = trips_df.apply(lambda row: replace_missing_node(row, trips_df, pseudo_G, nodes))
     
-    return val
-
-
-#%%
-fp = Path.home() / "Documents/GitHub/Impedance-Calibration"
-
-#import dict of matched traces with link ids and geometry 
-with (fp/'matched_traces.pkl').open('rb') as fh:
-     matched_traces = pickle.load(fh)
-
-#import segment to use
-segment_filepaths = list((fp/'segments').glob('*'))
-
-results = {}
-
-#import network links
-links = gpd.read_file(fp/"final_network.gpkg",layer='links')
-
-#add turns
-psuedo_df, psuedo_G = create_pseudo_dual_graph(links)
-
-#create edge_dict for quicker lookup
-links['linkid'] = list(zip(links['source'],links['target']))
-edge_dict = links.set_index('linkid').to_dict('index')
-
-#condense
-links = links[['linkid','source','target','name','bearing','weight','geometry']]
-
-#get midpoint of all links
-links.geometry = links.geometry.centroid
-
-#create pseudo dual graph
-df_line, psuedo_G = create_pseudo_dual_graph(links)
-
-
-
-
-links['length_ft'] = links.length
-
-
-
-
-for segment_filepath in segment_filepaths:
-    trips_df = pd.read_csv(segment_filepath)
+#     #inputs
+#     sum_all = trips_df['chosen_length'].sum() * 5280
+#     links['tup'] = list(zip(links['A'],links['B']))
+#     link_lengths = dict(zip(links['tup'],links['length_ft']))
+#     durations = []
+#     ods = list(set(trips_df['od'].tolist()))
     
-    trips_df['od'] = trips_df['od'].apply(lambda row: ast.literal_eval(row))
-    
-    #inputs
-    sum_all = trips_df['chosen_length'].sum() * 5280
-    links['tup'] = list(zip(links['A'],links['B']))
-    link_lengths = dict(zip(links['tup'],links['length_ft']))
-    durations = []
-    ods = list(set(trips_df['od'].tolist()))
-    
-    start = time.time()
-    bounds = [[-5,5],[-5,5],[-5,5]]
-    x = minimize(objective_function, bounds, args=(links,G,ods,trips_df,matched_traces,durations), method='pso')
-    end = time.time()
-    print(f'Took {(end-start)/60/60} hours')
-    results[segment_filepath] = (x.x,x.fun)
+#     start = time.time()
+#     bounds = [[-5,5],[-5,5],[-5,5]]
+#     x = minimize(objective_function, bounds, args=(links,G,ods,trips_df,matched_traces,durations), method='pso')
+#     end = time.time()
+#     print(f'Took {(end-start)/60/60} hours')
+#     results[segment_filepath] = (x.x,x.fun)
 
-#%%
-timestr = time.strftime("%Y-%m-%d-%H-%M")
-with (fp/f"calibration_results_{timestr}.pkl").open('wb') as fh:
-    pickle.dump(results,fh)
+# #%%
+# timestr = time.strftime("%Y-%m-%d-%H-%M")
+# with (fp/f"calibration_results_{timestr}.pkl").open('wb') as fh:
+#     pickle.dump(results,fh)
 
 
-new_results = {key.parts[-1].split('.csv')[0]:items for key, items in results.items()}
-new_results = pd.DataFrame.from_dict(new_results,orient='index',columns=['coefs','overlap'])
-new_results[['not_beltline','not_infra','2lanes','30mph']] = new_results['coefs'].apply(pd.Series)
+# new_results = {key.parts[-1].split('.csv')[0]:items for key, items in results.items()}
+# new_results = pd.DataFrame.from_dict(new_results,orient='index',columns=['coefs','overlap'])
+# new_results[['not_beltline','not_infra','2lanes','30mph']] = new_results['coefs'].apply(pd.Series)
