@@ -102,8 +102,6 @@ def create_pseudo_dual_graph(edges,source_col,target_col,linkid_col,oneway_col):
     #use networkx line graph function to create pseudo dual graph
     G_line = nx.line_graph(G)
     df_line = nx.to_pandas_edgelist(G_line)
-    
-    #remove one ways?
 
     #get expanded tuples to columns for exporting purposes
     df_line[['source_A','source_B','source_Z']] = pd.DataFrame(df_line['source'].tolist(), index=df_line.index)
@@ -134,10 +132,6 @@ def create_pseudo_dual_graph(edges,source_col,target_col,linkid_col,oneway_col):
     #change in azimuth
     df_line['azimuth_change'] = (df_line['target_azimuth'] - df_line['source_azimuth']) % 360
     
-    # #connect lines
-    # df_line['geometry'] = df_line.apply(lambda row: MultiLineString([row['geometry_x'],row['geometry_y']]),axis=1)
-    # df_line.drop(columns=['geometry_x','geometry_y'],inplace=True)
-    
     #angle here
     '''
     straight < 30 or > 330
@@ -155,26 +149,22 @@ def create_pseudo_dual_graph(edges,source_col,target_col,linkid_col,oneway_col):
     df_line.loc[right,'turn_type'] = 'right'
     df_line.loc[backwards,'turn_type'] = 'uturn'
     df_line.loc[left,'turn_type'] = 'left'
-    
-    #throw out backwards for now
-    #df_line = df_line[df_line['turn_type']!='backwards']
-    
-    #turn to gdf
-    #df_line = gpd.GeoDataFrame(df_line,crs=edges.crs,geometry='geometry')
 
     #create new source and target columns
     df_line['source'] = tuple(zip(df_line['source_A'],df_line['source_B']))
     df_line['target'] = tuple(zip(df_line['target_A'],df_line['target_B']))
 
-    #remove duplicate edges
+    #remove duplicate edges (duplicates still retained in df_edges and df_line)
     pseudo_df = df_line[['source','target']].drop_duplicates()
     
-    #pseudo graph too (doesn't have to be multidigraph because duplicate edges will be dropped after cost assignment)
+    #pseudo graph too
+    # not sure how to have shortest path algorithm report back the currect multigraph result
+    # instead we use pseudo_df to know which link pairs had the lowest cost
     pseudo_G = nx.DiGraph()
     for row in pseudo_df[['source','target']].itertuples(index=False):
         edge_data = {'weight':1}
         pseudo_G.add_edge(row[0], row[1],**edge_data)
-    
+
     return df_edges, df_line, pseudo_G
 
 

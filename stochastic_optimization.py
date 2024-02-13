@@ -62,6 +62,13 @@ def turn_impedance_function(betas,pseudo_links):
     pseudo_links['turn_cost'] = pseudo_links['turn_type'].map(turn_costs)
     return pseudo_links
 
+def impedance_update(df_links,pseudo_links,pseudo_G):
+    '''
+    This function updates the network graph with the correct weights
+    '''
+
+    return pseudo_G
+
 def objective_function(betas,links,pseudo_links,pseudo_G,matched_traces,exact=False,follow_up=False):
 
     #prevent negative link weights
@@ -99,7 +106,8 @@ def objective_function(betas,links,pseudo_links,pseudo_G,matched_traces,exact=Fa
     #only keep link with the lowest cost
     costs = pseudo_links.groupby(['source','target'])['total_cost'].min()
 
-    #get linkids used
+    #get linkids used to retreive link geometries for overlap functions
+    #we don't care about direction in this case
     source_cols = ['source','source_linkid','source_reverse_link']
     target_cols = ['target','target_linkid','target_reverse_link']
     min_links = pseudo_links.loc[pseudo_links.groupby(['source','target'])['total_cost'].idxmin()]
@@ -107,6 +115,7 @@ def objective_function(betas,links,pseudo_links,pseudo_G,matched_traces,exact=Fa
     target_links = min_links[target_cols]
     source_links.columns = ['A_B','linkid','reverse_link']
     target_links.columns = ['A_B','linkid','reverse_link']
+    #what keeps a_b from not being duplicated here?
     linkids = pd.concat([source_links,target_links],ignore_index=True).drop_duplicates().set_index('A_B')
 
     #update edge weights
